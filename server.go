@@ -18,6 +18,7 @@ type Subscription struct {
 	cursor int64 // last position delivered to the subscriber
 	acked  int64 // last position acknowledged by the subscriber
 	resync bool
+	gen    uint64 // incremented on every supersede; stale pumps are ignored
 	send   chan Event
 	cancel context.CancelFunc
 	last   time.Time
@@ -129,12 +130,16 @@ func (s *Server) registerLocked(id string, mode Mode, afterSeq int64) (*Subscrip
 		}
 		existing.resync = false
 		existing.mode = mode
+		existing.gen++
+		// Resume from the first change the client has not yet processed:
+		// the client-supplied cursor, raised to the acknowledged floor so
+		// confirmed changes are never replayed. The delivered cursor is
+		// deliberately NOT a floor: changes delivered into the buffer but
+		// not yet processed (drained on resync or lost on disconnect) must
+		// be redelivered.
 		start := afterSeq
 		if existing.acked > start {
 			start = existing.acked
-		}
-		if existing.cursor > start {
-			start = existing.cursor
 		}
 		existing.cursor = start
 		existing.send = nil
@@ -151,28 +156,47 @@ func (s *Server) registerLocked(id string, mode Mode, afterSeq int64) (*Subscrip
 }
 
 // trackLocked returns the active subscription for id, creating it on first
-// use. It does not supersede an existing stream. Caller must hold s.mu.
-func (s *Server) trackLocked(id string, mode Mode, afterSeq int64) (*Subscription, error) {
+// use. It does not supersede an existing stream. The returned flag reports
+// whether the caller created the registration; creators of one-shot
+// (poll/long-poll) registrations must release them with untrack when the
+// request finishes so finished requests do not occupy subscription slots.
+// Caller must hold s.mu.
+func (s *Server) trackLocked(id string, mode Mode, afterSeq int64) (*Subscription, bool, error) {
 	if s.shuttingDown {
-		return nil, ErrShutdown
+		return nil, false, ErrShutdown
 	}
 	if sub, ok := s.subs[id]; ok {
 		if sub.resync {
-			return nil, ErrResync
+			return nil, false, ErrResync
 		}
 		if afterSeq > sub.cursor {
 			sub.cursor = afterSeq
 		}
 		sub.mode = mode
 		sub.last = s.clock.Now()
-		return sub, nil
+		return sub, false, nil
 	}
 	if len(s.subs) >= s.cfg.MaxSubscriptions {
-		return nil, ErrTooManySubscriptions
+		return nil, false, ErrTooManySubscriptions
 	}
 	sub := &Subscription{srv: s, id: id, mode: mode, cursor: afterSeq, last: s.clock.Now()}
 	s.subs[id] = sub
-	return sub, nil
+	return sub, true, nil
+}
+
+// untrack releases a one-shot registration created by trackLocked. It is a
+// no-op if the caller did not create the entry, or if the entry has since
+// been superseded by a stream (which owns a cancel func and stays registered
+// to preserve its resume state).
+func (s *Server) untrack(id string, sub *Subscription, created bool) {
+	if !created {
+		return
+	}
+	s.mu.Lock()
+	if cur, ok := s.subs[id]; ok && cur == sub && cur.cancel == nil {
+		delete(s.subs, id)
+	}
+	s.mu.Unlock()
 }
 
 // Subscribe registers (or reactivates) a subscription. If a subscription
@@ -240,11 +264,12 @@ func (s *Server) waitForChanges(ctx context.Context, afterSeq int64, limit int, 
 // It returns the changes and the next cursor to use.
 func (s *Server) Poll(ctx context.Context, id string, afterSeq int64, limit int) ([]Change, int64, error) {
 	s.mu.Lock()
-	sub, err := s.trackLocked(id, ModePoll, afterSeq)
+	sub, created, err := s.trackLocked(id, ModePoll, afterSeq)
 	s.mu.Unlock()
 	if err != nil {
 		return nil, afterSeq, err
 	}
+	defer s.untrack(id, sub, created)
 
 	s.wg.Add(1)
 	defer s.wg.Done()
@@ -266,11 +291,12 @@ func (s *Server) Poll(ctx context.Context, id string, afterSeq int64, limit int)
 // an empty slice with no error.
 func (s *Server) LongPoll(ctx context.Context, id string, afterSeq int64, limit int, timeout time.Duration) ([]Change, int64, error) {
 	s.mu.Lock()
-	sub, err := s.trackLocked(id, ModeLongPoll, afterSeq)
+	sub, created, err := s.trackLocked(id, ModeLongPoll, afterSeq)
 	s.mu.Unlock()
 	if err != nil {
 		return nil, afterSeq, err
 	}
+	defer s.untrack(id, sub, created)
 
 	s.wg.Add(1)
 	defer s.wg.Done()
@@ -309,10 +335,11 @@ func (s *Server) Stream(ctx context.Context, id string, afterSeq int64) (<-chan 
 	ch := make(chan Event, s.cfg.BufferSize)
 	sub.send = ch
 	sub.cancel = cancel
+	gen := sub.gen
 	s.mu.Unlock()
 
 	s.wg.Add(1)
-	go s.pump(sub, ch, streamCtx)
+	go s.pump(sub, ch, streamCtx, gen)
 	return ch, nil
 }
 
@@ -320,8 +347,15 @@ func (s *Server) Stream(ctx context.Context, id string, afterSeq int64) (<-chan 
 // closes its event channel. The subscriber reconnects with its last cursor
 // and resumes from the log. Buffered events are drained first so the
 // resync marker can always be delivered; the marker is informational.
-func (s *Server) enterResync(sub *Subscription, ch chan Event, cause error) {
+// If the subscription has been superseded (gen mismatch) the stream is
+// obsolete: its channel is closed without touching the shared state.
+func (s *Server) enterResync(sub *Subscription, ch chan Event, cause error, gen uint64) {
 	s.mu.Lock()
+	if sub.gen != gen {
+		s.mu.Unlock()
+		s.sendClosed(ch)
+		return
+	}
 	sub.resync = true
 	cursor := sub.cursor
 	s.mu.Unlock()
@@ -353,7 +387,9 @@ func (s *Server) sendClosed(ch chan Event) {
 // log and pushes them to the subscriber's bounded buffer. Sends block when
 // the buffer is full, applying backpressure to this subscriber only; if the
 // subscriber stays blocked past the write timeout it is resynchronized.
-func (s *Server) pump(sub *Subscription, ch chan Event, ctx context.Context) {
+// gen identifies this pump's registration generation: once the subscription
+// is superseded, the pump stops updating shared subscription state.
+func (s *Server) pump(sub *Subscription, ch chan Event, ctx context.Context, gen uint64) {
 	defer s.wg.Done()
 
 	hb := s.clock.Ticker(s.cfg.HeartbeatInterval)
@@ -377,7 +413,7 @@ func (s *Server) pump(sub *Subscription, ch chan Event, ctx context.Context) {
 			s.sendClosed(ch)
 			return false
 		case <-timer.C():
-			s.enterResync(sub, ch, ErrSlowConsumer)
+			s.enterResync(sub, ch, ErrSlowConsumer, gen)
 			return false
 		}
 	}
@@ -385,7 +421,7 @@ func (s *Server) pump(sub *Subscription, ch chan Event, ctx context.Context) {
 	for {
 		changes, err := s.log.Read(after, streamBatchSize)
 		if err != nil {
-			s.enterResync(sub, ch, err)
+			s.enterResync(sub, ch, err, gen)
 			return
 		}
 		if len(changes) > 0 {
@@ -395,8 +431,10 @@ func (s *Server) pump(sub *Subscription, ch chan Event, ctx context.Context) {
 				}
 				after = c.Seq
 				s.mu.Lock()
-				sub.cursor = after
-				sub.last = s.clock.Now()
+				if sub.gen == gen {
+					sub.cursor = after
+					sub.last = s.clock.Now()
+				}
 				s.mu.Unlock()
 			}
 			continue
