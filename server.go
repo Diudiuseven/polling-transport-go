@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -10,15 +11,37 @@ import (
 // per stream read iteration.
 const streamBatchSize = 64
 
-// Subscription is a registered subscriber of the change log.
+// progressIdleTTL bounds how long server-side acknowledgement progress is
+// remembered for an id without an active connection or any activity. It is
+// an internal hygiene limit, not a user-visible configuration: progress
+// entries only exist to let reconnecting clients use a stale cursor without
+// re-receiving acknowledged changes.
+const progressIdleTTL = 10 * time.Minute
+
+// progressSoftFactor sets the progress-table size (as a multiple of
+// MaxSubscriptions) above which idle progress entries are swept.
+const progressSoftFactor = 4
+
+// subProgress is the lightweight, capacity-free memory kept for a subscriber
+// id after its active connection is gone. It never counts against
+// MaxSubscriptions: subscription slots only track live connections.
+type subProgress struct {
+	acked int64 // last position acknowledged by the subscriber
+	last  time.Time
+}
+
+// Subscription is an active subscriber connection (in-flight request or
+// live stream) of the change log.
 type Subscription struct {
 	srv    *Server
 	id     string
 	mode   Mode
-	cursor int64 // last position delivered to the subscriber
-	acked  int64 // last position acknowledged by the subscriber
+	cursor int64 // last position delivered on this connection generation
 	resync bool
-	send   chan Event
+	// gen is the connection generation. Every (re)attach for the same id
+	// increments it; a superseded goroutine must not touch slot state once
+	// its generation is stale.
+	gen    uint64
 	cancel context.CancelFunc
 	last   time.Time
 }
@@ -36,11 +59,13 @@ func (s *Subscription) Cursor() int64 {
 	return s.cursor
 }
 
-// Acked returns the subscription's last acknowledged cursor.
+// Acked returns the last acknowledged cursor remembered for the
+// subscription's id, even if the acknowledgement was recorded by a previous
+// connection generation.
 func (s *Subscription) Acked() int64 {
 	s.srv.mu.Lock()
 	defer s.srv.mu.Unlock()
-	return s.acked
+	return s.srv.ackedLocked(s.id)
 }
 
 // Server is the unified transport server. It serves poll, long-poll and
@@ -50,8 +75,14 @@ type Server struct {
 	log   *ChangeLog
 	clock Clock
 
-	mu           sync.Mutex
-	subs         map[string]*Subscription
+	mu sync.Mutex
+	// subs holds active connection slots (live streams and in-flight
+	// one-shot requests). Its size never exceeds MaxSubscriptions.
+	subs map[string]*Subscription
+	// progress remembers acknowledged cursors for ids that have no active
+	// connection slot. It is bounded by idle sweeping and never counts
+	// against MaxSubscriptions.
+	progress     map[string]*subProgress
 	shut         chan struct{}
 	shuttingDown bool
 	wg           sync.WaitGroup
@@ -75,11 +106,12 @@ func New(cfg Config, opts ...Option) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		cfg:   cfg,
-		log:   NewChangeLog(),
-		clock: RealClock{},
-		subs:  make(map[string]*Subscription),
-		shut:  make(chan struct{}),
+		cfg:      cfg,
+		log:      NewChangeLog(),
+		clock:    RealClock{},
+		subs:     make(map[string]*Subscription),
+		progress: make(map[string]*subProgress),
+		shut:     make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -118,73 +150,151 @@ func (s *Server) Subscription(id string) *Subscription {
 	return s.subs[id]
 }
 
-// registerLocked creates or supersedes a subscription. Caller must hold s.mu.
-func (s *Server) registerLocked(id string, mode Mode, afterSeq int64) (*Subscription, error) {
-	if s.shuttingDown {
-		return nil, ErrShutdown
+// ackedLocked returns the highest acknowledged cursor recorded for id,
+// whether the acknowledgement came from an active slot's stored progress or
+// from progress left behind by a previous connection.
+func (s *Server) ackedLocked(id string) int64 {
+	if p, ok := s.progress[id]; ok {
+		return p.acked
 	}
+	return 0
+}
+
+// rememberAckLocked records an acknowledgement for id and touches its
+// progress activity time.
+func (s *Server) rememberAckLocked(id string, seq int64) {
+	p := s.progress[id]
+	if p == nil {
+		p = &subProgress{}
+		s.progress[id] = p
+	}
+	if seq > p.acked {
+		p.acked = seq
+	}
+	p.last = s.clock.Now()
+}
+
+// releaseLocked ends the current connection generation for id. If the slot
+// still belongs to that generation it is removed (freeing the subscription
+// capacity) and its acknowledgement progress is retained out-of-band so a
+// later reconnect can clamp a stale cursor. A superseded slot is left
+// untouched for the newer generation.
+func (s *Server) releaseLocked(id string, gen uint64) {
+	sub := s.subs[id]
+	if sub == nil || sub.gen != gen {
+		return
+	}
+	delete(s.subs, id)
+	p := s.progress[id]
+	if p == nil {
+		p = &subProgress{}
+		s.progress[id] = p
+	}
+	// Only explicit Acks advance the resume floor. Delivery that was merely
+	// buffered or handed out (but not acknowledged) stays replayable, so the
+	// release only refreshes activity time.
+	p.last = s.clock.Now()
+}
+
+// sweepProgressLocked bounds the progress table: once it grows well past the
+// active subscription capacity, entries that have been idle (no attach and
+// no ack) beyond progressIdleTL are forgotten. Active slots are never
+// removed. Sweeping is amortized into request registration, so there is no
+// background goroutine or timer to leak.
+func (s *Server) sweepProgressLocked() {
+	soft := s.cfg.MaxSubscriptions * progressSoftFactor
+	if len(s.progress) <= soft {
+		return
+	}
+	cutoff := s.clock.Now().Add(-progressIdleTTL)
+	for id, p := range s.progress {
+		if _, active := s.subs[id]; active {
+			continue
+		}
+		if p.last.Before(cutoff) {
+			delete(s.progress, id)
+		}
+	}
+}
+
+// beginLocked attaches a new connection generation for id and returns the
+// slot, the generation tag the caller must present on release, and the
+// effective resume start position. Resume semantics are identical for every
+// transport: delivery starts strictly after max(client cursor, server
+// remembered ack). Changes already acknowledged are never re-delivered;
+// everything delivered but not yet acknowledged (including events buffered
+// for a slow subscriber whose connection dropped) is replayed. The
+// per-connection delivery cursor is reset to the start, so a stale
+// delivery position from a superseded connection can never skip changes.
+//
+// ephemeral marks one-shot poll/long-poll requests, which release the slot
+// when the request returns even if no newer generation superseded it.
+func (s *Server) beginLocked(id string, mode Mode, afterSeq int64, ephemeral bool, cancel context.CancelFunc) (*Subscription, uint64, int64, error) {
+	if s.shuttingDown {
+		return nil, 0, afterSeq, ErrShutdown
+	}
+	// A same-id request supersedes whatever connection generation is active:
+	// a replaced stream pump or suspended long-poll is cancelled.
 	if existing, ok := s.subs[id]; ok {
 		if existing.cancel != nil {
 			existing.cancel()
 		}
+		// Preserve acknowledgements recorded by the outgoing generation.
+		// Stream delivery that was merely buffered (possibly unread) must
+		// not be treated as acknowledged; that is handled by the caller
+		// updating progress only on explicit Ack.
 		existing.resync = false
 		existing.mode = mode
+		existing.gen++
 		start := afterSeq
-		if existing.acked > start {
-			start = existing.acked
-		}
-		if existing.cursor > start {
-			start = existing.cursor
+		if a := s.ackedLocked(id); a > start {
+			start = a
 		}
 		existing.cursor = start
-		existing.send = nil
-		existing.cancel = nil
+		// Store the cancel func for every generation: it lets a later
+		// same-id request interrupt a suspended long-poll and lets Shutdown
+		// wake in-flight requests (nil for non-blocking polls).
+		existing.cancel = cancel
 		existing.last = s.clock.Now()
-		return existing, nil
+		if p := s.progress[id]; p != nil {
+			p.last = s.clock.Now()
+		}
+		return existing, existing.gen, start, nil
 	}
 	if len(s.subs) >= s.cfg.MaxSubscriptions {
-		return nil, ErrTooManySubscriptions
+		return nil, 0, afterSeq, ErrTooManySubscriptions
 	}
-	sub := &Subscription{srv: s, id: id, mode: mode, cursor: afterSeq, last: s.clock.Now()}
+	sub := &Subscription{
+		srv:    s,
+		id:     id,
+		mode:   mode,
+		cursor: afterSeq,
+		gen:    1,
+		last:   s.clock.Now(),
+	}
+	if !ephemeral {
+		sub.cancel = cancel
+	}
 	s.subs[id] = sub
-	return sub, nil
+	if a := s.ackedLocked(id); a > sub.cursor {
+		sub.cursor = a
+	}
+	s.sweepProgressLocked()
+	return sub, sub.gen, sub.cursor, nil
 }
 
-// trackLocked returns the active subscription for id, creating it on first
-// use. It does not supersede an existing stream. Caller must hold s.mu.
-func (s *Server) trackLocked(id string, mode Mode, afterSeq int64) (*Subscription, error) {
-	if s.shuttingDown {
-		return nil, ErrShutdown
-	}
-	if sub, ok := s.subs[id]; ok {
-		if sub.resync {
-			return nil, ErrResync
-		}
-		if afterSeq > sub.cursor {
-			sub.cursor = afterSeq
-		}
-		sub.mode = mode
-		sub.last = s.clock.Now()
-		return sub, nil
-	}
-	if len(s.subs) >= s.cfg.MaxSubscriptions {
-		return nil, ErrTooManySubscriptions
-	}
-	sub := &Subscription{srv: s, id: id, mode: mode, cursor: afterSeq, last: s.clock.Now()}
-	s.subs[id] = sub
-	return sub, nil
-}
-
-// Subscribe registers (or reactivates) a subscription. If a subscription
-// with the same id already exists, it is superseded (reconnect semantics)
-// and the new subscription starts at max(afterSeq, last acknowledged).
+// Subscribe registers (or reactivates) a persistent subscription slot. The
+// slot is retained across the call; use Stream to serve an event stream on
+// it and Unsubscribe to release it.
 func (s *Server) Subscribe(ctx context.Context, id string, mode Mode, afterSeq int64) (*Subscription, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.registerLocked(id, mode, afterSeq)
+	sub, _, _, err := s.beginLocked(id, mode, afterSeq, false, nil)
+	return sub, err
 }
 
-// Unsubscribe removes a subscription and releases its resources.
+// Unsubscribe removes the subscription, forgets its resume progress and
+// releases all its resources.
 func (s *Server) Unsubscribe(ctx context.Context, id string) error {
 	s.mu.Lock()
 	sub, ok := s.subs[id]
@@ -193,6 +303,7 @@ func (s *Server) Unsubscribe(ctx context.Context, id string) error {
 		return ErrSubscriptionNotFound
 	}
 	delete(s.subs, id)
+	delete(s.progress, id)
 	if sub.cancel != nil {
 		sub.cancel()
 	}
@@ -200,14 +311,13 @@ func (s *Server) Unsubscribe(ctx context.Context, id string) error {
 	return nil
 }
 
-// touch updates the subscription cursor and last-active time.
-func (s *Server) touch(sub *Subscription, cursor int64) {
-	s.mu.Lock()
+// advanceCursorLocked moves the connection delivery cursor forward and
+// touches activity time. Caller must hold s.mu.
+func (s *Server) advanceCursorLocked(sub *Subscription, cursor int64) {
 	if cursor > sub.cursor {
 		sub.cursor = cursor
 	}
 	sub.last = s.clock.Now()
-	s.mu.Unlock()
 }
 
 // waitForChanges suspends until changes are available after afterSeq, the
@@ -237,10 +347,11 @@ func (s *Server) waitForChanges(ctx context.Context, afterSeq int64, limit int, 
 }
 
 // Poll reads up to limit changes after the given cursor without waiting.
-// It returns the changes and the next cursor to use.
+// It returns the changes and the next cursor to use. The request occupies a
+// subscription slot only while in flight and releases it on return.
 func (s *Server) Poll(ctx context.Context, id string, afterSeq int64, limit int) ([]Change, int64, error) {
 	s.mu.Lock()
-	sub, err := s.trackLocked(id, ModePoll, afterSeq)
+	sub, gen, start, err := s.beginLocked(id, ModePoll, afterSeq, true, nil)
 	s.mu.Unlock()
 	if err != nil {
 		return nil, afterSeq, err
@@ -248,25 +359,39 @@ func (s *Server) Poll(ctx context.Context, id string, afterSeq int64, limit int)
 
 	s.wg.Add(1)
 	defer s.wg.Done()
+	defer func() {
+		s.mu.Lock()
+		s.releaseLocked(id, gen)
+		s.mu.Unlock()
+	}()
 
-	changes, err := s.log.Read(afterSeq, limit)
+	changes, err := s.log.Read(start, limit)
 	if err != nil {
-		return nil, afterSeq, err
+		return nil, start, err
 	}
-	next := afterSeq
+	next := start
 	if len(changes) > 0 {
 		next = changes[len(changes)-1].Seq
 	}
-	s.touch(sub, next)
+	s.mu.Lock()
+	if s.subs[id] == sub {
+		s.advanceCursorLocked(sub, next)
+	}
+	s.mu.Unlock()
 	return changes, next, nil
 }
 
 // LongPoll reads up to limit changes after the given cursor, suspending
-// until changes are available or the timeout elapses. A timeout returns
-// an empty slice with no error.
+// until changes are available or the timeout elapses. A timeout returns an
+// empty slice with no error. The request occupies a subscription slot only
+// while in flight and releases it on return; a same-id reconnect while
+// suspended cancels the stale request.
 func (s *Server) LongPoll(ctx context.Context, id string, afterSeq int64, limit int, timeout time.Duration) ([]Change, int64, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	s.mu.Lock()
-	sub, err := s.trackLocked(id, ModeLongPoll, afterSeq)
+	sub, gen, start, err := s.beginLocked(id, ModeLongPoll, afterSeq, true, cancel)
 	s.mu.Unlock()
 	if err != nil {
 		return nil, afterSeq, err
@@ -274,92 +399,165 @@ func (s *Server) LongPoll(ctx context.Context, id string, afterSeq int64, limit 
 
 	s.wg.Add(1)
 	defer s.wg.Done()
+	defer func() {
+		s.mu.Lock()
+		s.releaseLocked(id, gen)
+		s.mu.Unlock()
+	}()
 
 	if timeout <= 0 {
 		timeout = s.cfg.LongPollTimeout
 	}
-	changes, err := s.waitForChanges(ctx, afterSeq, limit, timeout)
+	changes, err := s.waitForChanges(ctx, start, limit, timeout)
 	if err != nil {
-		return nil, afterSeq, err
+		// A same-id reconnect cancels the stale suspended request; report
+		// it as cancelled to that stale caller. Server shutdown, which also
+		// closes s.shut, reports ErrShutdown instead.
+		if errors.Is(err, context.Canceled) {
+			s.mu.Lock()
+			down := s.shuttingDown
+			superseded := false
+			if cur := s.subs[id]; cur != nil && cur.gen != gen {
+				superseded = true
+			}
+			s.mu.Unlock()
+			if down && !superseded {
+				err = ErrShutdown
+			}
+		}
+		return nil, start, err
 	}
-	next := afterSeq
+	next := start
 	if len(changes) > 0 {
 		next = changes[len(changes)-1].Seq
 	}
-	s.touch(sub, next)
+	s.mu.Lock()
+	if s.subs[id] == sub {
+		s.advanceCursorLocked(sub, next)
+	}
+	s.mu.Unlock()
 	return changes, next, nil
 }
 
 // Stream opens a long-lived event stream starting after the given cursor.
+// A same-id stream (or any other request for that id) supersedes the
+// previous connection generation; the old pump is cancelled and must hand
+// the slot over rather than close or release it.
 func (s *Server) Stream(ctx context.Context, id string, afterSeq int64) (<-chan Event, error) {
 	streamCtx, cancel := context.WithCancel(ctx)
 
 	s.mu.Lock()
-	if s.shuttingDown {
-		s.mu.Unlock()
-		cancel()
-		return nil, ErrShutdown
-	}
-	sub, err := s.registerLocked(id, ModeStream, afterSeq)
+	sub, gen, start, err := s.beginLocked(id, ModeStream, afterSeq, false, cancel)
 	if err != nil {
 		s.mu.Unlock()
 		cancel()
 		return nil, err
 	}
 	ch := make(chan Event, s.cfg.BufferSize)
-	sub.send = ch
-	sub.cancel = cancel
 	s.mu.Unlock()
 
 	s.wg.Add(1)
-	go s.pump(sub, ch, streamCtx)
+	go s.pump(sub, gen, start, ch, streamCtx)
 	return ch, nil
 }
 
-// enterResync marks the subscriber as requiring resynchronization and
-// closes its event channel. The subscriber reconnects with its last cursor
-// and resumes from the log. Buffered events are drained first so the
-// resync marker can always be delivered; the marker is informational.
-func (s *Server) enterResync(sub *Subscription, ch chan Event, cause error) {
+// enterResync enqueues the resync marker that terminates the given
+// connection generation. It does not move the cursor: the client reconnects
+// with its true processed position, and resume always starts after
+// max(client cursor, acked). Buffered events are drained first so the marker
+// is deliverable; drained events remain in the log and are replayed on
+// reconnect. The caller (the owning pump) closes the channel afterwards, so
+// this function never closes it itself and therefore cannot double-close
+// while racing cancellation.
+func (s *Server) enterResync(sub *Subscription, gen uint64, ch chan Event, cause error) {
 	s.mu.Lock()
-	sub.resync = true
-	cursor := sub.cursor
+	cursor := int64(0)
+	current := s.subs[sub.id] == sub && sub.gen == gen
+	if current {
+		sub.resync = true
+		cursor = sub.cursor
+	}
 	s.mu.Unlock()
 
-	// Drain buffered events so the resync marker always has room. The
-	// drained events remain in the log and are replayed on reconnect.
+	if !current {
+		// A newer generation owns this id; do not inject anything into a
+		// channel the successor is tearing down.
+		return
+	}
+
 	for {
 		select {
 		case <-ch:
+		case <-s.shut:
+			return
 		default:
 			goto delivered
 		}
 	}
 delivered:
-	ch <- Event{Type: EventResync, Err: cause, Cursor: cursor}
-	close(ch)
-}
-
-// sendClosed delivers a terminal EventClosed and closes the channel.
-func (s *Server) sendClosed(ch chan Event) {
 	select {
-	case ch <- Event{Type: EventClosed}:
-	default:
+	case ch <- Event{Type: EventResync, Err: cause, Cursor: cursor}:
+	case <-s.shut:
 	}
-	close(ch)
 }
 
 // pump is the per-stream background goroutine. It pulls changes from the
 // log and pushes them to the subscriber's bounded buffer. Sends block when
 // the buffer is full, applying backpressure to this subscriber only; if the
 // subscriber stays blocked past the write timeout it is resynchronized.
-func (s *Server) pump(sub *Subscription, ch chan Event, ctx context.Context) {
+//
+// The pump advances only its own connection-generation cursor (the last
+// event actually handed to the channel). That cursor is never used to skip
+// changes on reconnect: resume starts from the client's reported position
+// clamped by the acked cursor, so events buffered-but-unread when the
+// connection dropped are replayed instead of forming a hole.
+func (s *Server) pump(sub *Subscription, gen uint64, after int64, ch chan Event, ctx context.Context) {
 	defer s.wg.Done()
 
 	hb := s.clock.Ticker(s.cfg.HeartbeatInterval)
 	defer hb.Stop()
 
-	after := sub.Cursor()
+	// closeOnce serializes every terminal channel action: a blocked send
+	// racing with cancellation must not double-close the channel.
+	var closeOnce sync.Once
+	closeWith := func(ev *Event) {
+		closeOnce.Do(func() {
+			if ev != nil {
+				select {
+				case ch <- *ev:
+				default:
+				}
+			}
+			close(ch)
+		})
+	}
+
+	// stale reports whether this pump has been superseded by a newer
+	// connection generation for the same id.
+	stale := func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		cur := s.subs[sub.id]
+		return cur != sub || cur.gen != gen
+	}
+
+	// finish is the terminal action. A superseded pump neither owns the
+	// current slot nor the successor's channel; it only closes its own
+	// (already replaced) channel so its client's range loop terminates.
+	finish := func(sendClosed bool) {
+		if stale() {
+			closeWith(nil)
+			return
+		}
+		if sendClosed {
+			closeWith(&Event{Type: EventClosed})
+		} else {
+			closeWith(nil)
+		}
+		s.mu.Lock()
+		s.releaseLocked(sub.id, gen)
+		s.mu.Unlock()
+	}
 
 	// send delivers one event, blocking until there is room, the write
 	// timeout elapses, the client goes away or the server shuts down.
@@ -371,21 +569,35 @@ func (s *Server) pump(sub *Subscription, ch chan Event, ctx context.Context) {
 		case ch <- ev:
 			return true
 		case <-ctx.Done():
-			s.sendClosed(ch)
+			finish(true)
 			return false
 		case <-s.shut:
-			s.sendClosed(ch)
+			finish(true)
 			return false
 		case <-timer.C():
-			s.enterResync(sub, ch, ErrSlowConsumer)
+			s.enterResync(sub, gen, ch, ErrSlowConsumer)
+			// Resync terminates this generation: close the channel and drop
+			// the slot so a client reconnecting with its true processed
+			// cursor re-attaches and gets the backlog replayed.
+			closeWith(nil)
+			s.mu.Lock()
+			s.releaseLocked(sub.id, gen)
+			s.mu.Unlock()
 			return false
 		}
 	}
 
 	for {
+		if stale() {
+			return
+		}
 		changes, err := s.log.Read(after, streamBatchSize)
 		if err != nil {
-			s.enterResync(sub, ch, err)
+			s.enterResync(sub, gen, ch, err)
+			closeWith(nil)
+			s.mu.Lock()
+			s.releaseLocked(sub.id, gen)
+			s.mu.Unlock()
 			return
 		}
 		if len(changes) > 0 {
@@ -395,8 +607,9 @@ func (s *Server) pump(sub *Subscription, ch chan Event, ctx context.Context) {
 				}
 				after = c.Seq
 				s.mu.Lock()
-				sub.cursor = after
-				sub.last = s.clock.Now()
+				if cur := s.subs[sub.id]; cur == sub && cur.gen == gen {
+					s.advanceCursorLocked(sub, after)
+				}
 				s.mu.Unlock()
 			}
 			continue
@@ -410,16 +623,19 @@ func (s *Server) pump(sub *Subscription, ch chan Event, ctx context.Context) {
 				return
 			}
 		case <-ctx.Done():
-			s.sendClosed(ch)
+			finish(true)
 			return
 		case <-s.shut:
-			s.sendClosed(ch)
+			finish(true)
 			return
 		}
 	}
 }
 
-// Ack acknowledges all changes up to and including seq for the subscription.
+// Ack acknowledges all changes up to and including seq for the subscriber.
+// Acknowledgements are recorded against the id (whether or not a connection
+// is currently attached) and clamp every later resume for that id, so an
+// acknowledged change is never re-delivered on any transport.
 func (s *Server) Ack(ctx context.Context, id string, seq int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -427,17 +643,14 @@ func (s *Server) Ack(ctx context.Context, id string, seq int64) error {
 	if s.shuttingDown {
 		return ErrShutdown
 	}
-	sub, ok := s.subs[id]
-	if !ok {
-		return ErrSubscriptionNotFound
-	}
 	if seq > s.log.Frontier() {
 		return ErrCursorAhead
 	}
-	if seq > sub.acked {
-		sub.acked = seq
+	if seq < 0 {
+		return ErrBadCursor
 	}
-	if seq > sub.cursor {
+	s.rememberAckLocked(id, seq)
+	if sub := s.subs[id]; sub != nil && seq > sub.cursor {
 		sub.cursor = seq
 	}
 	return nil
